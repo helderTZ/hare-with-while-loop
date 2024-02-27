@@ -1,0 +1,180 @@
+diff --git a/hare/ast/expr.ha b/hare/ast/expr.ha
+index 32783f91..111dab4d 100644
+--- a/hare/ast/expr.ha
++++ b/hare/ast/expr.ha
+@@ -284,6 +284,15 @@ export type for_expr = struct {
+ 	label: label,
+ };
+ 
++// A while loop.
++//
++// 	while (foo < bar) quux
++export type while_expr = struct {
++	cond: *expr,
++	body: *expr,
++	label: label,
++};
++
+ // A free expression.
+ //
+ // 	free(foo)
+@@ -439,7 +448,7 @@ export type expr = struct {
+ 		free_expr | error_assert_expr | if_expr | insert_expr |
+ 		compound_expr | match_expr | len_expr | size_expr |
+ 		offset_expr | propagate_expr | return_expr | slice_expr |
+-		switch_expr | unarithm_expr | variadic_expr | yield_expr),
++		switch_expr | unarithm_expr | variadic_expr | while_expr | yield_expr),
+ };
+ 
+ // Frees resources associated with a Hare [[expr]]ession.
+@@ -577,6 +586,11 @@ case let e: *expr =>
+ 		free(f.afterthought);
+ 		expr_finish(f.body);
+ 		free(f.body);
++	case let f: while_expr =>
++		expr_finish(f.cond);
++		free(f.cond);
++		expr_finish(f.body);
++		free(f.body);
+ 	case let f: free_expr =>
+ 		expr_finish(f);
+ 		free(f);
+diff --git a/hare/lex/token.ha b/hare/lex/token.ha
+index 8604f2d7..593315c7 100644
+--- a/hare/lex/token.ha
++++ b/hare/lex/token.ha
+@@ -78,6 +78,7 @@ export type ltok = enum uint {
+ 	VALIST,
+ 	VASTART,
+ 	VOID,
++    WHILE,
+ 	YIELD,
+ 	LAST_KEYWORD = YIELD,
+ 
+@@ -229,6 +230,7 @@ const bmap: [_]str = [
+ 	"valist",
+ 	"vastart",
+ 	"void",
++    "while",
+ 	"yield",
+ 	"=>",
+ 	"&",
+diff --git a/hare/parse/+test/expr_test.ha b/hare/parse/+test/expr_test.ha
+index 9f3e15d3..aab5e16b 100644
+--- a/hare/parse/+test/expr_test.ha
++++ b/hare/parse/+test/expr_test.ha
+@@ -222,6 +222,22 @@
+ ");
+ };
+ 
++@test fn while_expr() void = {
++	roundtrip("export fn main() void = {
++	while (true) {
++		x;
++	};
++	while :label (true) {
++		x;
++	};
++    let x = 0;
++	while (x < 10) {
++		x;
++	};
++};
++");
++};
++
+ @test fn if_expr() void = {
+ 	roundtrip("export fn main() void = {
+ 	if (x == y) {
+diff --git a/hare/parse/expr.ha b/hare/parse/expr.ha
+index b5efc56d..92aecde3 100644
+--- a/hare/parse/expr.ha
++++ b/hare/parse/expr.ha
+@@ -21,7 +21,7 @@ export fn expr(lexer: *lex::lexer) (ast::expr | error) = {
+ 	];
+ 
+ 	const ex = match (peek(lexer, ltok::IF, ltok::FOR, ltok::BREAK,
+-		ltok::CONTINUE, ltok::RETURN, ltok::YIELD)?) {
++		ltok::CONTINUE, ltok::RETURN, ltok::YIELD, ltok::WHILE)?) {
+ 	case void =>
+ 		yield binarithm(lexer, void, 0)?;
+ 	case let tok: lex::token =>
+@@ -30,6 +30,8 @@ export fn expr(lexer: *lex::lexer) (ast::expr | error) = {
+ 			yield if_expr(lexer)?;
+ 		case ltok::FOR =>
+ 			yield for_expr(lexer)?;
++        case ltok::WHILE =>
++            yield while_expr(lexer)?;
+ 		case ltok::BREAK, ltok::CONTINUE, ltok::RETURN =>
+ 			yield control(lexer)?;
+ 		case ltok::YIELD =>
+@@ -730,6 +732,29 @@ fn for_expr(lexer: *lex::lexer) (ast::expr | error) = {
+ 	};
+ };
+ 
++fn while_expr(lexer: *lex::lexer) (ast::expr | error) = {
++	const tok = want(lexer, ltok::WHILE)?;
++	const label = if (try(lexer, ltok::COLON)? is lex::token) {
++		const tok = want(lexer, ltok::NAME)?;
++		yield tok.1 as str;
++	} else "";
++
++	want(lexer, ltok::LPAREN)?;
++	const cond = alloc(expr(lexer)?);
++	want(lexer, ltok::RPAREN)?;
++
++	const body = alloc(expr(lexer)?);
++	return ast::expr {
++		start = tok.2,
++		end = lex::prevloc(lexer),
++		expr = ast::while_expr {
++			cond = cond,
++			body = body,
++			label = label,
++		},
++	};
++};
++
+ fn free_expr(lexer: *lex::lexer) (ast::expr | error) = {
+ 	const start = want(lexer, ltok::FREE)?;
+ 	want(lexer, ltok::LPAREN)?;
+diff --git a/hare/unparse/expr.ha b/hare/unparse/expr.ha
+index bb8f17db..c33dda28 100644
+--- a/hare/unparse/expr.ha
++++ b/hare/unparse/expr.ha
+@@ -354,6 +354,8 @@ fn _expr(ctx: *context, syn: *synfunc, e: *ast::expr) (size | io::error) = {
+ 		return z;
+ 	case let e: ast::for_expr =>
+ 		return for_expr(ctx, syn, &e)?;
++	case let e: ast::while_expr =>
++		return while_expr(ctx, syn, &e)?;
+ 	case let e: ast::free_expr =>
+ 		let z = syn(ctx, "free", synkind::KEYWORD)?;
+ 		z += syn(ctx, "(", synkind::PUNCTUATION)?;
+@@ -773,6 +775,26 @@ fn for_expr(
+ 	return z;
+ };
+ 
++fn while_expr(
++	ctx: *context,
++	syn: *synfunc,
++	e: *ast::while_expr,
++) (size | io::error) = {
++	let z = syn(ctx, "while", synkind::KEYWORD)?;
++	z += space(ctx)?;
++	if (e.label != "") {
++		z += syn(ctx, ":", synkind::LABEL)?;
++		z += syn(ctx, e.label, synkind::LABEL)?;
++		z += space(ctx)?;
++	};
++	z += syn(ctx, "(", synkind::PUNCTUATION)?;
++	z += _expr(ctx, syn, e.cond)?;
++	z += syn(ctx, ")", synkind::PUNCTUATION)?;
++	z += space(ctx)?;
++	z += _expr(ctx, syn, e.body)?;
++	return z;
++};
++
+ fn switch_expr(
+ 	ctx: *context,
+ 	syn: *synfunc,
